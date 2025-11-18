@@ -22,13 +22,17 @@ class ClothingTracker:
         
     def setup_kalman_filter(self):
         """Настройка фильтра Калмана для предсказания позиции"""
+        # Модель состояния: [x, y, vx, vy]. Измерения: [x, y].
         kalman = cv2.KalmanFilter(4, 2)
+        # Матрица измерений H: берем только позицию из состояния
         kalman.measurementMatrix = np.array([[1, 0, 0, 0],
                                             [0, 1, 0, 0]], np.float32)
+        # Переходная матрица F: добавляет скорость к позиции (dt=1 кадр)
         kalman.transitionMatrix = np.array([[1, 0, 1, 0],
                                            [0, 1, 0, 1],
                                            [0, 0, 1, 0],
                                            [0, 0, 0, 1]], np.float32)
+        # Ковариация процессного шума Q: чем больше, тем гибче фильтр
         kalman.processNoiseCov = 0.03 * np.eye(4, dtype=np.float32)
         return kalman
     
@@ -53,6 +57,7 @@ class ClothingTracker:
         roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         
         # Вычисляем средний цвет
+        # Средний HSV по ROI — компромисс между простотой и устойчивостью
         mean_color = cv2.mean(roi_hsv)[:3]
         self.captured_color = np.array(mean_color, dtype=np.uint8)
         
@@ -86,6 +91,7 @@ class ClothingTracker:
         fov_horizontal = np.radians(60)
         fov_vertical = np.radians(45)
         
+        # Нормируем смещение пикселя и масштабируем на FOV — получаем угловые отклонения
         angle_horizontal = ((x_pixel - cx) / frame_width) * fov_horizontal
         angle_vertical = ((cy - y_pixel) / frame_height) * fov_vertical
         
@@ -98,6 +104,7 @@ class ClothingTracker:
     
     def process_frame(self, frame):
         """Основная обработка кадра"""
+        # Конвертация в HSV и легкое размытие для снижения шума
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         hsv_frame = cv2.GaussianBlur(hsv_frame, (5, 5), 0)
         
@@ -121,7 +128,7 @@ class ClothingTracker:
             
             if valid_contours:
                 if self.last_position is not None:
-                    # Выбираем контур ближайший к последней позиции
+                    # Выбираем контур ближайший к последней позиции — стабилизирует трек
                     min_dist = float('inf')
                     for contour in valid_contours:
                         M = cv2.moments(contour)

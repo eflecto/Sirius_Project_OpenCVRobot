@@ -4,13 +4,19 @@ import numpy as np
 def simple_clothing_tracker():
     """
     Простой трекер одежды с автоматическим захватом цвета
+    Логика:
+    - Пользователь размещает одежду в центре кадра.
+    - По нажатию пробела измеряется средний HSV-цвет в ROI.
+    - Создается маска по диапазону вокруг эталонного цвета, затем очищается морфологией.
+    - Выбирается самый крупный контур, вычисляются центр, bbox, примерная дистанция и угол.
+    - Ведется траектория и рисуется мини-радар «вид сверху» для интуитивной навигации.
     """
     cap = cv2.VideoCapture(0)
     
     # Переменные состояния
     tracking_enabled = False
     target_hsv = None
-    hsv_range = (15, 50, 50)  # H, S, V диапазоны
+    hsv_range = (15, 50, 50)  # H, S, V диапазоны — ширина порога вокруг эталона
     
     # Для хранения истории движения
     trajectory = []
@@ -34,6 +40,7 @@ def simple_clothing_tracker():
         h, w = frame.shape[:2]
         
         # Рисуем центральную область для захвата
+        # Квадратный ROI — компромисс между точностью и простотой взаимодействия.
         if not tracking_enabled:
             # Область захвата (центр кадра)
             roi_size = 100
@@ -57,6 +64,8 @@ def simple_clothing_tracker():
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             
             # Создаем маску по цвету (правильная работа с типами)
+            # lower/upper ограничивают диапазон вокруг целевого HSV, все операции с int
+            # и последующим приведение к uint8, чтобы избежать ошибок в OpenCV.
             lower = np.array([
                 max(0, int(target_hsv[0]) - hsv_range[0]),
                 max(0, int(target_hsv[1]) - hsv_range[1]),
@@ -71,6 +80,7 @@ def simple_clothing_tracker():
             mask = cv2.inRange(hsv, lower, upper)
             
             # Очищаем маску
+            # Простая морфология для удаления мелких шумов и расширения целевой области.
             mask = cv2.erode(mask, None, iterations=2)
             mask = cv2.dilate(mask, None, iterations=2)
             
@@ -83,6 +93,7 @@ def simple_clothing_tracker():
                 largest = max(contours, key=cv2.contourArea)
                 
                 # Проверяем минимальный размер
+                # Слишком маленькие области игнорируются как шум/ложные срабатывания.
                 if cv2.contourArea(largest) > 500:
                     # Получаем центр масс
                     M = cv2.moments(largest)
@@ -100,15 +111,18 @@ def simple_clothing_tracker():
                         
                         # Оценка расстояния (простая формула)
                         # Предполагаем, что средняя ширина торса 50см
+                        # Чем шире bbox, тем ближе объект.
                         focal_length = 600  # примерное значение
                         real_width = 50  # см
                         distance = (real_width * focal_length) / w_box if w_box > 0 else 0
                         distance_m = distance / 100
                         
                         # Угол до человека
+                        # Вычислен по отклонению центра объекта от центра кадра.
                         angle = np.degrees(np.arctan((cx - w/2) / focal_length))
                         
                         # Координаты в системе робота
+                        # Перевод из полярного представления (distance, angle) в XY.
                         x_robot = distance_m * np.sin(np.radians(angle))
                         y_robot = distance_m * np.cos(np.radians(angle))
                         
@@ -119,6 +133,7 @@ def simple_clothing_tracker():
                         cv2.circle(frame_display, (cx, cy), 7, (0, 0, 255), -1)
                         
                         # Рисуем траекторию
+                        # Градиент толщины для визуализации истории движения.
                         for i in range(1, len(trajectory)):
                             thickness = int(np.sqrt(i / float(len(trajectory))) * 5)
                             cv2.line(frame_display, trajectory[i-1], trajectory[i], 
@@ -138,6 +153,7 @@ def simple_clothing_tracker():
                                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                         
                         # Рисуем "радар" - вид сверху
+                        # Простая мини-карта, где центр — робот, точка — целевой объект.
                         radar_center = (w - 100, h - 100)
                         radar_radius = 80
                         cv2.circle(frame_display, radar_center, radar_radius, (100, 100, 100), 1)
@@ -165,6 +181,7 @@ def simple_clothing_tracker():
                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             
             # Показываем маску
+            # Уменьшенная копия бинарной маски для удобства диагностики.
             mask_colored = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
             mask_display = cv2.resize(mask_colored, (w//3, h//3))
             frame_display[10:10+h//3, w-w//3-10:w-10] = mask_display
@@ -182,6 +199,7 @@ def simple_clothing_tracker():
                 hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
                 
                 # Вычисляем средний цвет в ROI
+                # Среднее по ROI устойчиво, но при сложном фоне лучше адаптивные методики.
                 target_hsv = cv2.mean(hsv_roi)[:3]
                 target_hsv = tuple(map(int, target_hsv))
                 
