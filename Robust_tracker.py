@@ -5,16 +5,22 @@
 - детектируем человека по цвету одежды (торс),
 - берем bounding box торса (ширина = ширина торса, высота = талия-плечи),
 - считаем расстояние по ширине и высоте bbox через калиброванную камеру.
+
+Добавлено:
+- корректный учёт того, что калибровка сделана при разрешении 1920x1080
+  (параметры пересчитываются под текущее разрешение кадра);
+- режимы тестирования: с вебкамеры, по видеофайлу и по одиночному изображению.
 """
 
 import cv2
 import numpy as np
 import time
+import os
 
 
 class RobustClothingTracker:
     def __init__(self, calibration_file='camera_calib_result.npz'):
-        self.cap = cv2.VideoCapture(1)
+        self.cap = None  # камера инициализируется в run()
 
         # Параметры цвета
         self.target_hsv = None
@@ -36,21 +42,20 @@ class RobustClothingTracker:
         self.max_trajectory = 30
 
         # ---- ПАРАМЕТРЫ ДЛЯ РАССТОЯНИЯ ----
-        # Это были "примерные" параметры, оставим как запасной вариант
-        self.focal_length = 500  # fallback, если калибровка не загрузится
+        # Фоллбек, если калибровка не загрузится
+        self.focal_length = 500
 
         # Геометрия торса (НЕ весь рост):
-        # ширина = ширина торса по кадру,
-        # высота = расстояние от талии до плеч.
-        self.TORSO_WIDTH_CM = 44   # средняя ширина торса (можешь подправить под себя)
-        self.TORSO_HEIGHT_CM = 70  # примерная высота торса (талия-плечи), тоже можно подкрутить
+        self.TORSO_WIDTH_CM = 44   # ширина торса
+        self.TORSO_HEIGHT_CM = 70  # высота торса (талия-плечи)
 
-        # Параметры камеры (заполнятся из калибровки)
+        # Параметры камеры (из калибровки)
         self.calibration_loaded = False
-        self.fx = None
-        self.fy = None
-        self.cx = None
-        self.cy = None
+        self.fx_orig = None
+        self.fy_orig = None
+        self.cx_orig = None
+        self.cy_orig = None
+        self.calib_size = None  # (width, height) при калибровке
 
         self._load_calibration(calibration_file)
 
@@ -61,7 +66,7 @@ class RobustClothingTracker:
         print("ПРОБЕЛ - захват цвета из центра")
         print("'+'/'-' - увеличить/уменьшить чувствительность")
         print("'r' - сброс")
-        print("'q' - выход")
+        print("'q' или ESC - выход")
         print("=" * 50)
 
     # ---------------------------------------------------------------------- #
@@ -69,28 +74,63 @@ class RobustClothingTracker:
     # ---------------------------------------------------------------------- #
 
     def _load_calibration(self, calibration_file):
-        """Загрузка калибровки камеры как в yolo_distance_basic."""
+        """Загрузка калибровки камеры (fx, fy, cx, cy, image_size)."""
         try:
             calib_data = np.load(calibration_file)
             camera_matrix = calib_data['camera_matrix']
             dist_coeffs = calib_data['dist_coeffs']  # пока не используем
+            image_size = calib_data.get('image_size', None)
 
-            self.fx = float(camera_matrix[0, 0])
-            self.fy = float(camera_matrix[1, 1])
-            self.cx = float(camera_matrix[0, 2])
-            self.cy = float(camera_matrix[1, 2])
+            self.fx_orig = float(camera_matrix[0, 0])
+            self.fy_orig = float(camera_matrix[1, 1])
+            self.cx_orig = float(camera_matrix[0, 2])
+            self.cy_orig = float(camera_matrix[1, 2])
+
+            if image_size is not None:
+                # В npz он лежит как [width, height]
+                self.calib_size = (int(image_size[0]), int(image_size[1]))
+            else:
+                # Если нет, по умолчанию считаем калибровку под 1920x1080
+                self.calib_size = (1920, 1080)
 
             self.calibration_loaded = True
 
             print("[КАЛИБРОВКА] Успешно загружена из", calibration_file)
-            print(f"   fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}")
+            print(f"   fx={self.fx_orig:.2f}, fy={self.fy_orig:.2f}, "
+                  f"cx={self.cx_orig:.2f}, cy={self.cy_orig:.2f}")
+            print(f"   image_size (калибровки): {self.calib_size[0]}x{self.calib_size[1]}")
 
         except Exception as e:
-            # Фоллбек — работаем как раньше, с приблизительным focal_length,
-            # центр кадра будем брать из размера кадра.
             self.calibration_loaded = False
             print("[КАЛИБРОВКА] Не удалось загрузить:", e)
             print("Работаю с приближённым focal_length =", self.focal_length)
+
+    def _get_effective_intrinsics(self, frame_size):
+        """
+        Пересчёт матрицы камеры под текущее разрешение кадра.
+        Калибровка делалась, например, при 1920x1080 — это считается масштаб 1.0.
+        Для других разрешений масштабируем fx, fy, cx, cy.
+        """
+        w_frame, h_frame = frame_size
+
+        if self.calibration_loaded and self.calib_size is not None:
+            calib_w, calib_h = self.calib_size
+            # масштаб по каждой оси
+            scale_x = w_frame / float(calib_w)
+            scale_y = h_frame / float(calib_h)
+
+            fx = self.fx_orig * scale_x
+            fy = self.fy_orig * scale_y
+            cx = self.cx_orig * scale_x
+            cy = self.cy_orig * scale_y
+        else:
+            # Фоллбек: примитивная модель камеры
+            fx = float(self.focal_length)
+            fy = fx
+            cx = w_frame / 2.0
+            cy = h_frame / 2.0
+
+        return fx, fy, cx, cy
 
     def calculate_distance_and_angle(self, bbox, frame_size):
         """
@@ -114,23 +154,13 @@ class RobustClothingTracker:
         bbox_center_x = x + w_box / 2.0
         bbox_center_y = y + h_box / 2.0
 
-        # Параметры камеры
-        if self.calibration_loaded:
-            fx = self.fx
-            fy = self.fy
-            cx = self.cx
-        else:
-            # Если калибровка не загружена — используем фоллбек
-            fx = float(self.focal_length)
-            fy = fx
-            cx = w_frame / 2.0
+        # Эффективные параметры камеры для текущего разрешения
+        fx, fy, cx, cy = self._get_effective_intrinsics(frame_size)
 
         # --- 1. Расстояние по ширине торса ---
-        # D_w = (реальная_ширина_торса * fx) / ширина_в_пикселях
         dist_by_width_cm = (self.TORSO_WIDTH_CM * fx) / w_box
 
         # --- 2. Расстояние по высоте торса ---
-        # D_h = (реальная_высота_торса * fy) / высота_в_пикселях
         dist_by_height_cm = (self.TORSO_HEIGHT_CM * fy) / h_box
 
         # --- 3. Итоговое расстояние вдоль оси камеры (среднее) ---
@@ -147,7 +177,7 @@ class RobustClothingTracker:
         distance_real = distance_z / np.cos(angle_rad)
 
         return {
-            "distance_z": distance_z,               # вдоль оси камеры (то, что нужно роботу вперёд)
+            "distance_z": distance_z,               # вдоль оси камеры
             "distance_real": distance_real,         # гипотенуза
             "angle_rad": angle_rad,
             "angle_deg": angle_deg,
@@ -162,7 +192,7 @@ class RobustClothingTracker:
     # ---------------------------------------------------------------------- #
 
     def capture_color_adaptive(self, frame):
-        """Адаптивный захват цвета с анализом гистограммы"""
+        """Адаптивный захват цвета с анализом гистограммы."""
         h, w = frame.shape[:2]
 
         roi_size = min(150, min(h, w) // 3)
@@ -211,7 +241,7 @@ class RobustClothingTracker:
         return True
 
     def create_mask(self, hsv_frame):
-        """Создание маски с защитой от ошибок"""
+        """Создание маски по выбранному цвету."""
         if self.target_hsv is None:
             return None
 
@@ -260,7 +290,7 @@ class RobustClothingTracker:
         return mask
 
     def process_frame(self, frame):
-        """Обработка одного кадра: трекинг + расчёт расстояния / координат"""
+        """Обработка одного кадра: трекинг + расчёт расстояния/координат."""
         display = frame.copy()
         h, w = frame.shape[:2]
 
@@ -272,8 +302,8 @@ class RobustClothingTracker:
                           (cx - roi_size // 2, cy - roi_size // 2),
                           (cx + roi_size // 2, cy + roi_size // 2),
                           (0, 255, 255), 2)
-            cv2.putText(display, "Place target here",
-                        (cx - 70, cy - roi_size // 2 - 10),
+            cv2.putText(display, "Press SPACE to capture color",
+                        (cx - 120, cy - roi_size // 2 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             return display, None
 
@@ -343,19 +373,17 @@ class RobustClothingTracker:
                 angle_deg = measurements["angle_deg"]
                 dist_by_width = measurements["dist_by_width"]
                 dist_by_height = measurements["dist_by_height"]
-
-                # Координаты цели в системе робота
-                x_robot = distance_z * np.sin(angle_rad)
-                y_robot = distance_z * np.cos(angle_rad)
             else:
                 distance_z = 0.0
                 distance_real = 0.0
                 angle_rad = 0.0
                 angle_deg = 0.0
-                x_robot = 0.0
-                y_robot = 0.0
                 dist_by_width = 0.0
                 dist_by_height = 0.0
+
+            # Координаты цели в системе робота (X вправо, Y вперёд)
+            x_robot = distance_z * np.sin(angle_rad)
+            y_robot = distance_z * np.cos(angle_rad)
 
             # Визуализация
             cv2.drawContours(display, [best_contour], -1, (0, 255, 0), 2)
@@ -369,24 +397,27 @@ class RobustClothingTracker:
                          self.trajectory[i], (255, 200, 0), thickness)
 
             # Инфо-бокс
-            info_bg = np.zeros((140, 380, 3), dtype=np.uint8)
-            info_bg[:] = (40, 40, 40)
-            display[10:150, 10:390] = cv2.addWeighted(
-                display[10:150, 10:390], 0.3, info_bg, 0.7, 0
-            )
+            info_h = 140
+            info_w = 420
+            if h > info_h + 20 and w > info_w + 20:
+                info_bg = np.zeros((info_h, info_w, 3), dtype=np.uint8)
+                info_bg[:] = (40, 40, 40)
+                roi = display[10:10 + info_h, 10:10 + info_w]
+                blended = cv2.addWeighted(roi, 0.3, info_bg, 0.7, 0)
+                display[10:10 + info_h, 10:10 + info_w] = blended
 
-            texts = [
-                f"Dist Z: {distance_z:.2f} m  (real: {distance_real:.2f} m)",
-                f"Angle: {angle_deg:.1f} deg",
-                f"Robot X: {x_robot:.2f} m, Y: {y_robot:.2f} m",
-                f"By W: {dist_by_width:.2f} m, by H: {dist_by_height:.2f} m",
-            ]
+                texts = [
+                    f"Dist Z: {distance_z:.2f} m  (real: {distance_real:.2f} m)",
+                    f"Angle: {angle_deg:.1f} deg",
+                    f"Robot X: {x_robot:.2f} m, Y: {y_robot:.2f} m",
+                    f"By W: {dist_by_width:.2f} m, by H: {dist_by_height:.2f} m",
+                ]
 
-            for i, text in enumerate(texts):
-                cv2.putText(display, text, (20, 35 + i * 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                for i, text in enumerate(texts):
+                    cv2.putText(display, text, (20, 35 + i * 25),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            cv2.putText(display, "TRACKING", (w - 120, 30),
+            cv2.putText(display, "TRACKING", (w - 140, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         else:
@@ -401,23 +432,24 @@ class RobustClothingTracker:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                             (0, 165, 255), 2)
             else:
-                cv2.putText(display, "TARGET LOST", (w - 150, 30),
+                cv2.putText(display, "TARGET LOST", (w - 180, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             (0, 0, 255), 2)
                 if self.lost_frames > self.max_lost_frames * 2:
                     self.trajectory = []
 
         # Мини-карта маски
-        mask_small = cv2.resize(mask, (w // 4, h // 4))
-        mask_colored = cv2.cvtColor(mask_small, cv2.COLOR_GRAY2BGR)
-        mask_colored[:, :, 1] = mask_small
-        display[h - h // 4 - 10:h - 10,
-                w - w // 4 - 10:w - 10] = mask_colored
+        if mask is not None:
+            mask_small = cv2.resize(mask, (w // 4, h // 4))
+            mask_colored = cv2.cvtColor(mask_small, cv2.COLOR_GRAY2BGR)
+            mask_colored[:, :, 1] = mask_small
+            display[h - h // 4 - 10:h - 10,
+                    w - w // 4 - 10:w - 10] = mask_colored
 
         return display, mask
 
     def adjust_sensitivity(self, increase=True):
-        """Регулировка чувствительности"""
+        """Регулировка чувствительности."""
         factor = 1.2 if increase else 0.8
 
         self.h_range = int(np.clip(self.h_range * factor, 5, 40))
@@ -426,8 +458,39 @@ class RobustClothingTracker:
 
         print(f"Новые диапазоны: H±{self.h_range}, S±{self.s_range}, V±{self.v_range}")
 
-    def run(self):
-        """Основной цикл"""
+    # ---------------------------------------------------------------------- #
+    #                            РЕЖИМЫ ЗАПУСКА                              #
+    # ---------------------------------------------------------------------- #
+
+    def _handle_common_keys(self, key, frame_for_capture=None):
+        """
+        Обработка клавиш, общая для всех режимов.
+        frame_for_capture нужен, чтобы при нажатии ПРОБЕЛа
+        захватывать цвет с текущего кадра.
+        """
+        if key == ord(' '):
+            if frame_for_capture is not None:
+                self.capture_color_adaptive(frame_for_capture)
+        elif key == ord('+') or key == ord('='):
+            self.adjust_sensitivity(increase=True)
+        elif key == ord('-') or key == ord('_'):
+            self.adjust_sensitivity(increase=False)
+        elif key == ord('r'):
+            self.tracking_active = False
+            self.target_hsv = None
+            self.trajectory = []
+            self.lost_frames = 0
+            print("Трекер сброшен")
+
+    def run_webcam(self, cam_index=0):
+        """Работа с живой камеры."""
+        self.cap = cv2.VideoCapture(cam_index)
+        if not self.cap.isOpened():
+            print(f"Не удалось открыть камеру {cam_index}")
+            return
+
+        print("[MODE] Webcam")
+
         while True:
             ret, frame = self.cap.read()
             if not ret:
@@ -436,35 +499,113 @@ class RobustClothingTracker:
 
             display, mask = self.process_frame(frame)
 
-            cv2.putText(display, "Press SPACE to capture",
+            cv2.putText(display, "WEBCAM MODE",
                         (10, display.shape[0] - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                        (200, 200, 200), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (200, 200, 200), 2)
 
             cv2.imshow('Robust Clothing Tracker', display)
             if mask is not None:
                 cv2.imshow('Mask', mask)
 
             key = cv2.waitKey(1) & 0xFF
-
-            if key == ord(' '):
-                self.capture_color_adaptive(frame)
-            elif key == ord('+') or key == ord('='):
-                self.adjust_sensitivity(increase=True)
-            elif key == ord('-') or key == ord('_'):
-                self.adjust_sensitivity(increase=False)
-            elif key == ord('r'):
-                self.tracking_active = False
-                self.target_hsv = None
-                self.trajectory = []
-                print("Трекер сброшен")
-            elif key == ord('q'):
+            if key in (ord('q'), 27):
                 break
+
+            self._handle_common_keys(key, frame_for_capture=frame)
 
         self.cap.release()
         cv2.destroyAllWindows()
 
+    def test_on_video(self, video_path):
+        """Тестирование на видеофайле."""
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"Не удалось открыть видео: {video_path}")
+            return
+
+        print(f"[MODE] Video file: {video_path}")
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Видео закончилось")
+                break
+
+            display, mask = self.process_frame(frame)
+
+            cv2.putText(display, "VIDEO MODE",
+                        (10, display.shape[0] - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (200, 200, 200), 2)
+
+            cv2.imshow('Robust Clothing Tracker', display)
+            if mask is not None:
+                cv2.imshow('Mask', mask)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord('q'), 27):
+                break
+
+            self._handle_common_keys(key, frame_for_capture=frame)
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+    def test_on_image(self, image_path):
+        """Тестирование на одиночном изображении (кадр статичный)."""
+        frame = cv2.imread(image_path)
+        if frame is None:
+            print(f"Не удалось прочитать изображение: {image_path}")
+            return
+
+        print(f"[MODE] Image file: {image_path} "
+              f"({frame.shape[1]}x{frame.shape[0]})")
+
+        while True:
+            display, mask = self.process_frame(frame)
+
+            cv2.putText(display, "IMAGE MODE (press SPACE to capture color)",
+                        (10, display.shape[0] - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (200, 200, 200), 2)
+
+            cv2.imshow('Robust Clothing Tracker', display)
+            if mask is not None:
+                cv2.imshow('Mask', mask)
+
+            key = cv2.waitKey(10) & 0xFF
+            if key in (ord('q'), 27):
+                break
+
+            self._handle_common_keys(key, frame_for_capture=frame)
+
+        cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
-    tracker = RobustClothingTracker()
-    tracker.run()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Robust clothing tracker + distance (color-based)."
+    )
+    parser.add_argument("--calib", type=str, default="camera_calib_result.npz",
+                        help="Путь к файлу калибровки камеры (.npz)")
+    parser.add_argument("--video", type=str, default=None,
+                        help="Путь к видеофайлу для теста")
+    parser.add_argument("--image", type=str, default=None,
+                        help="Путь к изображению для теста")
+    parser.add_argument("--cam", type=int, default=0,
+                        help="Индекс вебкамеры (по умолчанию 0)")
+
+    args = parser.parse_args()
+
+    tracker = RobustClothingTracker(calibration_file=args.calib)
+
+    # Приоритет: image > video > webcam
+    if args.image is not None:
+        tracker.test_on_image(args.image)
+    elif args.video is not None:
+        tracker.test_on_video(args.video)
+    else:
+        tracker.run_webcam(cam_index=args.cam)
