@@ -7,12 +7,13 @@
 - считаем расстояние по ширине и высоте bbox через калиброванную камеру.
 
 Добавлено:
-- корректный учёт того, что калибровка сделана при 1920x1080 (или другом размера),
+- корректный учёт того, что калибровка сделана при 1920x1080 (или другом размере),
   параметры пересчитываются под текущее разрешение кадра;
 - режимы тестирования: вебкамера, видео, фото;
 - крутилка дисторсии (для wide-angle): можно менять силу undistort в рантайме;
-- "квадрат поиска": после потери цели трекер некоторое время ищет её только
-  в области, где она была, и не перескакивает на другой большой контур.
+- "квадрат поиска": после появления цели трекер ищет её только
+  в области, где она была, и не перескакивает на другой контур в кадре;
+- сглаживание расстояния и угла по скользящему окну.
 """
 
 import cv2
@@ -37,7 +38,7 @@ class RobustClothingTracker:
         # Состояние трекинга
         self.tracking_active = False
         self.lost_frames = 0
-        self.max_lost_frames = 15  # в течение этого времени ищем только в локальном квадрате
+        self.max_lost_frames = 15  # используется только для отображения состояния, не для логики поиска
 
         # Траектория
         self.trajectory = []
@@ -75,17 +76,23 @@ class RobustClothingTracker:
         self.intrinsics_for_frame = None  # матрица камеры для текущего размера + undistort
         self.last_frame_size = None
 
+        # ---- СГЛАЖИВАНИЕ РАССТОЯНИЯ / УГЛА ----
+        self.smooth_window = 7
+        self.dist_history = []
+        self.angle_sin_history = []
+        self.angle_cos_history = []
+
         self._load_calibration(calibration_file)
 
         print("=" * 50)
         print("РОБАСТНЫЙ ТРЕКЕР ОДЕЖДЫ + КАЛИБРОВАННОЕ РАССТОЯНИЕ")
         print("=" * 50)
         print("Управление:")
-        print("ПРОБЕЛ    - захват цвета из центра")
-        print("'+'/'-'   - увеличить/уменьшить чувствительность по HSV")
-        print("'[' / ']' - уменьшить/увеличить коррекцию дисторсии")
-        print("'d'       - включить/выключить undistort")
-        print("'r'       - сброс трекера")
+        print("ПРОБЕЛ      - захват цвета из центра")
+        print("'+' / '-'   - увеличить/уменьшить чувствительность по HSV")
+        print("'[' / ']'   - уменьшить/увеличить коррекцию дисторсии")
+        print("'d'         - включить/выключить undistort")
+        print("'r'         - сброс трекера (и зоны поиска)")
         print("'q' или ESC - выход")
         print("=" * 50)
 
@@ -308,6 +315,38 @@ class RobustClothingTracker:
         return (rx <= px <= rx + rw) and (ry <= py <= ry + rh)
 
     # ---------------------------------------------------------------------- #
+    #                      СГЛАЖИВАНИЕ И СБРОС ФИЛЬТРА                       #
+    # ---------------------------------------------------------------------- #
+
+    def _reset_smoothing(self):
+        self.dist_history = []
+        self.angle_sin_history = []
+        self.angle_cos_history = []
+
+    def _smooth_measurements(self, distance_z, angle_rad):
+        """
+        Сглаживание расстояния и угла по скользящему окну.
+        Угол усредняется через sin/cos, чтобы не было проблем на границах.
+        """
+        # расстояние
+        self.dist_history.append(distance_z)
+        if len(self.dist_history) > self.smooth_window:
+            self.dist_history.pop(0)
+        mean_dist = float(sum(self.dist_history) / len(self.dist_history))
+
+        # угол
+        self.angle_sin_history.append(np.sin(angle_rad))
+        self.angle_cos_history.append(np.cos(angle_rad))
+        if len(self.angle_sin_history) > self.smooth_window:
+            self.angle_sin_history.pop(0)
+            self.angle_cos_history.pop(0)
+        mean_sin = float(sum(self.angle_sin_history) / len(self.angle_sin_history))
+        mean_cos = float(sum(self.angle_cos_history) / len(self.angle_cos_history))
+        smooth_angle_rad = float(np.arctan2(mean_sin, mean_cos))
+
+        return mean_dist, smooth_angle_rad
+
+    # ---------------------------------------------------------------------- #
     #                        ЦВЕТОВОЙ ТРЕКЕР ОДЕЖДЫ                          #
     # ---------------------------------------------------------------------- #
 
@@ -355,6 +394,7 @@ class RobustClothingTracker:
         self.tracking_active = True
         self.lost_frames = 0
         self.last_bbox = None  # при новом захвате начинаем с нуля
+        self._reset_smoothing()
 
         print(f"Цвет захвачен: HSV{tuple(self.target_hsv)}")
         print(f"Диапазоны: H±{self.h_range}, S±{self.s_range}, V±{self.v_range}")
@@ -469,16 +509,16 @@ class RobustClothingTracker:
 
         w_frame, h_frame = w, h
 
-        # --- ЛОКАЛЬНЫЙ ПОИСК В КВАДРАТЕ ВОКРУГ last_bbox ---
+        # --- ВЫБОР КОНТУРА С УЧЁТОМ ВЕЧНОЙ ЗОНЫ ПОИСКА ---
         if valid_contours:
-            if self.last_bbox is None or self.lost_frames >= self.max_lost_frames:
-                # Инициализация или давно потеряли — можно брать глобально самый большой
+            if self.last_bbox is None:
+                # Первое появление цели — выбираем глобально самый большой
                 valid_contours.sort(key=lambda x: x[1], reverse=True)
                 best_contour = valid_contours[0][0]
                 target_found = True
             else:
-                # Есть предыдущий bbox и цель недавно потеряна —
-                # ищем только в квадрате вокруг него
+                # Есть last_bbox: ИЩЕМ ТОЛЬКО В КВАДРАТЕ ВОКРУГ НЕГО.
+                # НИКАКОГО перехода на глобальный поиск.
                 search_rect = self._get_search_rect(self.last_bbox, (w_frame, h_frame))
                 roi_contours = []
                 for cnt, area in valid_contours:
@@ -490,6 +530,7 @@ class RobustClothingTracker:
                     roi_contours.sort(key=lambda x: x[1], reverse=True)
                     best_contour = roi_contours[0][0]
                     target_found = True
+                # else: никого в зоне — считаем, что цели нет (target_found = False)
 
         if target_found and best_contour is not None:
             self.lost_frames = 0
@@ -517,12 +558,19 @@ class RobustClothingTracker:
             )
 
             if measurements is not None:
-                distance_z = measurements["distance_z"]
-                distance_real = measurements["distance_real"]
-                angle_rad = measurements["angle_rad"]
-                angle_deg = measurements["angle_deg"]
+                raw_distance_z = measurements["distance_z"]
+                raw_distance_real = measurements["distance_real"]
+                raw_angle_rad = measurements["angle_rad"]
                 dist_by_width = measurements["dist_by_width"]
                 dist_by_height = measurements["dist_by_height"]
+
+                # Сглаживаем расстояние и угол
+                distance_z, angle_rad = self._smooth_measurements(
+                    raw_distance_z, raw_angle_rad
+                )
+                angle_deg = np.degrees(angle_rad)
+                # Пересчитываем real/offset по сглаженным значениям
+                distance_real = distance_z / np.cos(angle_rad) if np.cos(angle_rad) != 0 else raw_distance_real
             else:
                 distance_z = 0.0
                 distance_real = 0.0
@@ -547,8 +595,8 @@ class RobustClothingTracker:
                          self.trajectory[i], (255, 200, 0), thickness)
 
             # Инфо-бокс
-            info_h = 160
-            info_w = 440
+            info_h = 170
+            info_w = 460
             if h > info_h + 20 and w > info_w + 20:
                 info_bg = np.zeros((info_h, info_w, 3), dtype=np.uint8)
                 info_bg[:] = (40, 40, 40)
@@ -557,8 +605,8 @@ class RobustClothingTracker:
                 display[10:10 + info_h, 10:10 + info_w] = blended
 
                 texts = [
-                    f"Dist Z: {distance_z:.2f} m  (real: {distance_real:.2f} m)",
-                    f"Angle: {angle_deg:.1f} deg",
+                    f"Dist Z (smoothed): {distance_z:.2f} m  (real: {distance_real:.2f} m)",
+                    f"Angle (smoothed):  {angle_deg:.1f} deg",
                     f"Robot X: {x_robot:.2f} m, Y: {y_robot:.2f} m",
                     f"By W: {dist_by_width:.2f} m, by H: {dist_by_height:.2f} m",
                     f"Undistort: {'ON' if self.undistort_enabled else 'OFF'}  "
@@ -594,10 +642,10 @@ class RobustClothingTracker:
                 cv2.putText(display, "TARGET LOST", (w - 180, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             (0, 0, 255), 2)
-                # Если долго потеряны — очищаем траекторию и eventually last_bbox
-                if self.lost_frames > self.max_lost_frames * 2:
+                # Можно чистить траекторию, но last_bbox НЕ трогаем,
+                # чтобы область поиска оставалась постоянной.
+                if self.lost_frames > self.max_lost_frames * 4:
                     self.trajectory = []
-                    self.last_bbox = None
 
         # Мини-карта маски
         if mask is not None:
@@ -666,6 +714,7 @@ class RobustClothingTracker:
             self.trajectory = []
             self.lost_frames = 0
             self.last_bbox = None
+            self._reset_smoothing()
             print("Трекер сброшен")
 
     def run_webcam(self, cam_index=0):
