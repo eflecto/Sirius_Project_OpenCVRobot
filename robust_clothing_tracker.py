@@ -12,15 +12,14 @@
 - крутилка дисторсии для wide-angle ([ ] и 'd');
 - "вечная" зона поиска вокруг last_bbox (не перескакиваем на другие контуры);
 - сглаживание расстояния и угла по скользящему окну;
-- КАЛИБРОВКА ПО ОБРАЗЦУ:
-    * когда цель в кадре и bbox стабилен, жмём 'c';
-    * в консоли вводим примерное расстояние (м);
-    * далее расстояние считается относительно этого эталона.
+- калибровка расстояния по образцу ('c'): задаёшь реальное расстояние до объекта;
+- запись видео окна трекера ('v') в mp4.
 """
 
 import cv2
 import numpy as np
 import os
+from datetime import datetime
 
 
 class RobustClothingTracker:
@@ -90,6 +89,12 @@ class RobustClothingTracker:
         self.ref_bbox_w = None
         self.ref_bbox_h = None
 
+        # ---- ЗАПИСЬ ВИДЕО ----
+        self.record_enabled = False
+        self.video_writer = None
+        self.record_path = None
+        self.record_fps = 30.0
+
         self._load_calibration(calibration_file)
 
         print("=" * 50)
@@ -101,6 +106,7 @@ class RobustClothingTracker:
         print("'[' / ']'   - уменьшить/увеличить коррекцию дисторсии")
         print("'d'         - включить/выключить undistort")
         print("'c'         - калибровка расстояния по текущему bbox")
+        print("'v'         - старт/стоп записи видео окна трекера")
         print("'r'         - сброс трекера (цвет, зоны, калибровки)")
         print("'q' или ESC - выход")
         print("=" * 50)
@@ -147,11 +153,7 @@ class RobustClothingTracker:
             print("Работаю с приближённым focal_length =", self.focal_length)
 
     def _build_scaled_camera_matrix(self, frame_size):
-        """
-        Пересчёт матрицы камеры под текущее разрешение кадра.
-        Калибровка делалась, например, при 1920x1080 — это считается масштаб 1.0.
-        Для других разрешений масштабируем fx, fy, cx, cy.
-        """
+        """Пересчёт матрицы камеры под текущее разрешение кадра."""
         w_frame, h_frame = frame_size
 
         if self.calibration_loaded and self.calib_size is not None:
@@ -181,10 +183,7 @@ class RobustClothingTracker:
             return K
 
     def _update_undistort_maps(self, frame_size):
-        """
-        Пересчитываем карты undistort при изменении размера кадра или
-        коэффициента дисторсии.
-        """
+        """Пересчитываем карты undistort при изменении размера кадра или коэффициента дисторсии."""
         w_frame, h_frame = frame_size
         K_scaled = self._build_scaled_camera_matrix(frame_size)
 
@@ -212,8 +211,7 @@ class RobustClothingTracker:
     def _ensure_undistort_maps(self, frame_size):
         """Ленивая пересборка карт undistort при изменении размера или scale."""
         if (self.last_frame_size != frame_size or
-                self.undistort_map1 is None or
-                self.undistort_map2 is None):
+                self.undistort_map1 is None or self.undistort_map2 is None):
             self._update_undistort_maps(frame_size)
 
     def _get_effective_intrinsics(self, frame_size):
@@ -402,6 +400,41 @@ class RobustClothingTracker:
         print("Теперь расстояние будет считаться относительно этих значений.")
 
     # ---------------------------------------------------------------------- #
+    #                             ЗАПИСЬ ВИДЕО                               #
+    # ---------------------------------------------------------------------- #
+
+    def _start_recording(self, frame, fps=30.0, prefix="session"):
+        """Создать VideoWriter и начать запись."""
+        if frame is None:
+            print("[REC] Нет кадра для определения размера — запись не начата.")
+            return
+
+        h, w = frame.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{prefix}_track_{ts}.mp4"
+
+        writer = cv2.VideoWriter(filename, fourcc, fps, (w, h))
+        if not writer.isOpened():
+            print("[REC] Не удалось открыть файл для записи:", filename)
+            return
+
+        self.video_writer = writer
+        self.record_enabled = True
+        self.record_path = filename
+        self.record_fps = fps
+        print(f"[REC] Запись начата: {filename} (fps={fps:.1f}, size={w}x{h})")
+
+    def _stop_recording(self):
+        """Остановить запись и закрыть файл."""
+        if self.video_writer is not None:
+            self.video_writer.release()
+            print(f"[REC] Запись остановлена. Файл сохранён: {self.record_path}")
+        self.video_writer = None
+        self.record_enabled = False
+        self.record_path = None
+
+    # ---------------------------------------------------------------------- #
     #                        ЦВЕТОВОЙ ТРЕКЕР ОДЕЖДЫ                          #
     # ---------------------------------------------------------------------- #
 
@@ -531,6 +564,18 @@ class RobustClothingTracker:
             cv2.putText(display, "Press SPACE to capture color",
                         (cx - 120, cy - roi_size // 2 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+            # Отрисуем индикатор записи, если надо
+            if self.record_enabled:
+                cv2.putText(display, "REC",
+                            (w - 80, h - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                            (0, 0, 255), 2)
+
+            # Записываем кадр, если запись включена
+            if self.record_enabled and self.video_writer is not None:
+                self.video_writer.write(display)
+
             return display, None
 
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -704,7 +749,7 @@ class RobustClothingTracker:
                 cv2.putText(display, "TARGET LOST", (w - 180, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             (0, 0, 255), 2)
-                # Траекторию можно иногда чистить, но last_bbox не трогаем,
+                # Траекторию иногда чистим, но last_bbox не трогаем,
                 # чтобы зона поиска оставалась.
                 if self.lost_frames > self.max_lost_frames * 4:
                     self.trajectory = []
@@ -716,6 +761,17 @@ class RobustClothingTracker:
             mask_colored[:, :, 1] = mask_small
             display[h_frame - h_frame // 4 - 10:h_frame - 10,
                     w_frame - w_frame // 4 - 10:w_frame - 10] = mask_colored
+
+        # Индикатор записи
+        if self.record_enabled:
+            cv2.putText(display, "REC",
+                        (w_frame - 80, h_frame - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 0, 255), 2)
+
+        # Запись кадра в файл, если запись включена
+        if self.record_enabled and self.video_writer is not None:
+            self.video_writer.write(display)
 
         return display, mask
 
@@ -750,11 +806,13 @@ class RobustClothingTracker:
     #                            РЕЖИМЫ ЗАПУСКА                              #
     # ---------------------------------------------------------------------- #
 
-    def _handle_common_keys(self, key, frame_for_capture=None):
+    def _handle_common_keys(self, key, frame_for_capture=None,
+                            frame_for_record=None, fps=None, prefix="session"):
         """
         Обработка клавиш, общая для всех режимов.
         frame_for_capture нужен, чтобы при нажатии ПРОБЕЛа
         захватывать цвет с текущего кадра.
+        frame_for_record + fps + prefix нужны для старта/остановки записи.
         """
         if key == ord(' '):
             if frame_for_capture is not None:
@@ -773,6 +831,16 @@ class RobustClothingTracker:
         elif key == ord('c'):
             # Калибровка расстояния по текущему bbox
             self.calibrate_reference()
+        elif key == ord('v'):
+            # Старт/стоп записи
+            if not self.record_enabled:
+                if frame_for_record is not None:
+                    use_fps = fps if (fps is not None and fps > 0) else 30.0
+                    self._start_recording(frame_for_record, use_fps, prefix)
+                else:
+                    print("[REC] Нет кадра для записи.")
+            else:
+                self._stop_recording()
         elif key == ord('r'):
             self.tracking_active = False
             self.target_hsv = None
@@ -793,7 +861,12 @@ class RobustClothingTracker:
             print(f"Не удалось открыть камеру {cam_index}")
             return
 
-        print("[MODE] Webcam")
+        # Пытаемся узнать fps камеры
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if fps is None or fps <= 0:
+            fps = 30.0
+
+        print(f"[MODE] Webcam (fps ~ {fps:.1f})")
 
         while True:
             ret, frame = self.cap.read()
@@ -816,7 +889,16 @@ class RobustClothingTracker:
             if key in (ord('q'), 27):
                 break
 
-            self._handle_common_keys(key, frame_for_capture=frame)
+            self._handle_common_keys(
+                key,
+                frame_for_capture=frame,
+                frame_for_record=display,
+                fps=fps,
+                prefix="webcam"
+            )
+
+        if self.record_enabled:
+            self._stop_recording()
 
         self.cap.release()
         cv2.destroyAllWindows()
@@ -828,7 +910,14 @@ class RobustClothingTracker:
             print(f"Не удалось открыть видео: {video_path}")
             return
 
-        print(f"[MODE] Video file: {video_path}")
+        # fps видео
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps is None or fps <= 0:
+            fps = 30.0
+
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+
+        print(f"[MODE] Video file: {video_path} (fps ~ {fps:.1f})")
 
         while True:
             ret, frame = cap.read()
@@ -851,13 +940,22 @@ class RobustClothingTracker:
             if key in (ord('q'), 27):
                 break
 
-            self._handle_common_keys(key, frame_for_capture=frame)
+            self._handle_common_keys(
+                key,
+                frame_for_capture=frame,
+                frame_for_record=display,
+                fps=fps,
+                prefix=base_name
+            )
+
+        if self.record_enabled:
+            self._stop_recording()
 
         cap.release()
         cv2.destroyAllWindows()
 
     def test_on_image(self, image_path):
-        """Тестирование на одиночном изображении (кадр статичный)."""
+        """Тестирование на одиночном изображении (статичный кадр)."""
         frame = cv2.imread(image_path)
         if frame is None:
             print(f"Не удалось прочитать изображение: {image_path}")
@@ -865,6 +963,8 @@ class RobustClothingTracker:
 
         print(f"[MODE] Image file: {image_path} "
               f"({frame.shape[1]}x{frame.shape[0]})")
+
+        fps = 30.0  # условный fps для записи
 
         while True:
             display, mask = self.process_frame(frame)
@@ -882,7 +982,16 @@ class RobustClothingTracker:
             if key in (ord('q'), 27):
                 break
 
-            self._handle_common_keys(key, frame_for_capture=frame)
+            self._handle_common_keys(
+                key,
+                frame_for_capture=frame,
+                frame_for_record=display,
+                fps=fps,
+                prefix="image"
+            )
+
+        if self.record_enabled:
+            self._stop_recording()
 
         cv2.destroyAllWindows()
 
