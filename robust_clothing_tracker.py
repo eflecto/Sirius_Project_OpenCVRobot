@@ -13,7 +13,8 @@
 - "вечная" зона поиска вокруг last_bbox (не перескакиваем на другие контуры);
 - сглаживание расстояния и угла по скользящему окну;
 - калибровка расстояния по образцу ('c'): задаёшь реальное расстояние до объекта;
-- запись видео окна трекера ('v') в mp4.
+- запись видео окна трекера ('v') в mp4;
+- ПАМЯТЬ ВНЕШНОСТИ (appearance): HSV-гистограмма торса, чтобы не путать цель с другими.
 """
 
 import cv2
@@ -89,6 +90,12 @@ class RobustClothingTracker:
         self.ref_bbox_w = None
         self.ref_bbox_h = None
 
+        # ---- ПАМЯТЬ ВНЕШНОСТИ (appearance) ----
+        self.appearance_ref_hist = None
+        self.appearance_hist_bins = (16, 16)  # HxS
+        # Bhattacharyya: 0 = идеальное совпадение, 1 = очень далеко
+        self.appearance_max_bhat_dist = 0.5
+
         # ---- ЗАПИСЬ ВИДЕО ----
         self.record_enabled = False
         self.video_writer = None
@@ -102,12 +109,12 @@ class RobustClothingTracker:
         print("=" * 50)
         print("Управление:")
         print("ПРОБЕЛ      - захват цвета из центра")
-        print("'+' / '-'   - увеличить/уменьшить чувствительность по HSV")
-        print("'[' / ']'   - уменьшить/увеличить коррекцию дисторсии")
+        print("'+' / '-'   - изменить чувствительность по HSV")
+        print("'[' / ']'   - изменить коррекцию дисторсии")
         print("'d'         - включить/выключить undistort")
         print("'c'         - калибровка расстояния по текущему bbox")
         print("'v'         - старт/стоп записи видео окна трекера")
-        print("'r'         - сброс трекера (цвет, зоны, калибровки)")
+        print("'r'         - сброс трекера (цвет, зоны, калибровки, appearance)")
         print("'q' или ESC - выход")
         print("=" * 50)
 
@@ -330,7 +337,7 @@ class RobustClothingTracker:
         return (rx <= px <= rx + rw) and (ry <= py <= ry + rh)
 
     # ---------------------------------------------------------------------- #
-    #                      СГЛАЖИВАНИЕ И СБРОС ФИЛЬТРА                       #
+    #          СГЛАЖИВАНИЕ И СБРОС ФИЛЬТРА / ПАМЯТИ ВНЕШНОСТИ                #
     # ---------------------------------------------------------------------- #
 
     def _reset_smoothing(self):
@@ -360,6 +367,44 @@ class RobustClothingTracker:
         smooth_angle_rad = float(np.arctan2(mean_sin, mean_cos))
 
         return mean_dist, smooth_angle_rad
+
+    # ---------------------------------------------------------------------- #
+    #               ПАМЯТЬ ВНЕШНОСТИ: ГИСТОГРАММЫ ПО КОНТУРУ                 #
+    # ---------------------------------------------------------------------- #
+
+    def _compute_contour_hist(self, hsv_frame, cnt):
+        """
+        Строит HSV-гистограмму (H,S) для области внутри контура.
+        Возвращает (hist, bbox) или (None, None) если что-то не так.
+        """
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w <= 0 or h <= 0:
+            return None, None
+
+        patch = hsv_frame[y:y + h, x:x + w]
+        if patch.size == 0:
+            return None, None
+
+        # Маска внутри bbox для этого контура
+        cnt_shifted = cnt.copy()
+        cnt_shifted[:, :, 0] -= x
+        cnt_shifted[:, :, 1] -= y
+
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(mask, [cnt_shifted], -1, 255, -1)
+
+        hist = cv2.calcHist(
+            [patch],
+            [0, 1],            # H и S
+            mask,
+            [self.appearance_hist_bins[0], self.appearance_hist_bins[1]],
+            [0, 180, 0, 256]
+        )
+        if hist is None:
+            return None, None
+
+        cv2.normalize(hist, hist, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
+        return hist, (x, y, w, h)
 
     # ---------------------------------------------------------------------- #
     #                         КАЛИБРОВКА ПО ОБРАЗЦУ                          #
@@ -483,6 +528,7 @@ class RobustClothingTracker:
         self.lost_frames = 0
         self.last_bbox = None          # новая цель — новая зона
         self.ref_calibrated = False    # калибровка по старой цели не актуальна
+        self.appearance_ref_hist = None  # сбрасываем эталон внешности
         self._reset_smoothing()
 
         print(f"Цвет захвачен: HSV{tuple(self.target_hsv)}")
@@ -565,14 +611,14 @@ class RobustClothingTracker:
                         (cx - 120, cy - roi_size // 2 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            # Отрисуем индикатор записи, если надо
+            # Индикатор записи
             if self.record_enabled:
                 cv2.putText(display, "REC",
                             (w - 80, h - 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             (0, 0, 255), 2)
 
-            # Записываем кадр, если запись включена
+            # Пишем кадр, если запись включена
             if self.record_enabled and self.video_writer is not None:
                 self.video_writer.write(display)
 
@@ -610,13 +656,32 @@ class RobustClothingTracker:
 
         w_frame, h_frame = w, h
 
-        # --- ВЫБОР КОНТУРА С УЧЁТОМ ВЕЧНОЙ ЗОНЫ ПОИСКА ---
+        # --- ВЫБОР КОНТУРА С УЧЁТОМ ВЕЧНОЙ ЗОНЫ ПОИСКА И APPEARANCE ---
         if valid_contours:
             if self.last_bbox is None:
-                # Первое появление цели — выбираем глобально самый большой
-                valid_contours.sort(key=lambda x: x[1], reverse=True)
-                best_contour = valid_contours[0][0]
-                target_found = True
+                # Первое появление цели — пока нет last_bbox:
+                # если нет appearance_hist -> просто самый большой
+                if self.appearance_ref_hist is None:
+                    valid_contours.sort(key=lambda x: x[1], reverse=True)
+                    best_contour = valid_contours[0][0]
+                    target_found = True
+                else:
+                    # Есть эталон внешности (редкий случай) — выбираем по схожести
+                    best_dist = None
+                    best_cnt = None
+                    for cnt, area in valid_contours:
+                        hist, _ = self._compute_contour_hist(hsv, cnt)
+                        if hist is None:
+                            continue
+                        dist = cv2.compareHist(self.appearance_ref_hist, hist,
+                                               cv2.HISTCMP_BHATTACHARYYA)
+                        if best_dist is None or dist < best_dist:
+                            best_dist = dist
+                            best_cnt = cnt
+                    if best_cnt is not None and best_dist is not None \
+                            and best_dist <= self.appearance_max_bhat_dist:
+                        best_contour = best_cnt
+                        target_found = True
             else:
                 # Есть last_bbox: ИЩЕМ ТОЛЬКО В КВАДРАТЕ ВОКРУГ НЕГО.
                 search_rect = self._get_search_rect(self.last_bbox, (w_frame, h_frame))
@@ -627,16 +692,42 @@ class RobustClothingTracker:
                         roi_contours.append((cnt, area))
 
                 if roi_contours:
-                    roi_contours.sort(key=lambda x: x[1], reverse=True)
-                    best_contour = roi_contours[0][0]
-                    target_found = True
-                # else: никого в зоне — цель не найдена, но зона сохраняется
+                    if self.appearance_ref_hist is not None:
+                        # Выбор по минимальному Bhattacharyya расстоянию
+                        best_dist = None
+                        best_cnt = None
+                        for cnt, area in roi_contours:
+                            hist, _ = self._compute_contour_hist(hsv, cnt)
+                            if hist is None:
+                                continue
+                            dist = cv2.compareHist(self.appearance_ref_hist, hist,
+                                                   cv2.HISTCMP_BHATTACHARYYA)
+                            if best_dist is None or dist < best_dist:
+                                best_dist = dist
+                                best_cnt = cnt
+                        if best_cnt is not None and best_dist is not None \
+                                and best_dist <= self.appearance_max_bhat_dist:
+                            best_contour = best_cnt
+                            target_found = True
+                        # иначе: никто не похож достаточно => цель "не найдена", но зону не сбрасываем
+                    else:
+                        # Эталон внешности ещё не сформирован — выбираем по площади
+                        roi_contours.sort(key=lambda x: x[1], reverse=True)
+                        best_contour = roi_contours[0][0]
+                        target_found = True
 
         if target_found and best_contour is not None:
             self.lost_frames = 0
 
             x, y, w_box, h_box = cv2.boundingRect(best_contour)
             self.last_bbox = (x, y, w_box, h_box)
+
+            # Если ещё нет эталонной гистограммы, создаём её
+            if self.appearance_ref_hist is None:
+                ref_hist, _ = self._compute_contour_hist(hsv, best_contour)
+                if ref_hist is not None:
+                    self.appearance_ref_hist = ref_hist
+                    print("[APPEARANCE] Эталон внешности сохранён.")
 
             M = cv2.moments(best_contour)
             if M["m00"] > 0:
@@ -695,13 +786,13 @@ class RobustClothingTracker:
                          self.trajectory[i], (255, 200, 0), thickness)
 
             # Инфо-бокс
-            info_h = 190
-            info_w = 480
+            info_h = 210
+            info_w = 500
             if h > info_h + 20 and w > info_w + 20:
                 info_bg = np.zeros((info_h, info_w, 3), dtype=np.uint8)
                 info_bg[:] = (40, 40, 40)
-                roi = display[10:10 + info_h, 10:10 + info_w]
-                blended = cv2.addWeighted(roi, 0.3, info_bg, 0.7, 0)
+                roi_info = display[10:10 + info_h, 10:10 + info_w]
+                blended = cv2.addWeighted(roi_info, 0.3, info_bg, 0.7, 0)
                 display[10:10 + info_h, 10:10 + info_w] = blended
 
                 if self.ref_calibrated:
@@ -709,6 +800,8 @@ class RobustClothingTracker:
                               f"w_ref={self.ref_bbox_w:.0f}px, h_ref={self.ref_bbox_h:.0f}px"
                 else:
                     ref_str = "D_ref: not set (using torso model)"
+
+                app_str = "SET" if self.appearance_ref_hist is not None else "NOT SET"
 
                 texts = [
                     f"Dist Z (smoothed): {distance_z:.2f} m  (real: {distance_real:.2f} m)",
@@ -718,6 +811,7 @@ class RobustClothingTracker:
                     f"Undistort: {'ON' if self.undistort_enabled else 'OFF'}  "
                     f"scale={self.distortion_scale:.2f}",
                     f"Ref calib: {ref_str}",
+                    f"Appearance ref: {app_str}  (max dist={self.appearance_max_bhat_dist:.2f})",
                 ]
 
                 for i, text in enumerate(texts):
@@ -851,6 +945,7 @@ class RobustClothingTracker:
             self.ref_distance_m = None
             self.ref_bbox_w = None
             self.ref_bbox_h = None
+            self.appearance_ref_hist = None
             self._reset_smoothing()
             print("Трекер сброшен")
 
