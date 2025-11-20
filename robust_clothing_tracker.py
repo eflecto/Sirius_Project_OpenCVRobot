@@ -7,20 +7,22 @@
 - считаем расстояние по ширине и высоте bbox через калиброванную камеру.
 
 Добавлено:
-- корректный учёт того, что калибровка сделана при разрешении 1920x1080
-  (параметры пересчитываются под текущее разрешение кадра);
-- режимы тестирования: с вебкамеры, по видеофайлу и по одиночному изображению.
+- корректный учёт того, что калибровка сделана при 1920x1080 (или другом размера),
+  параметры пересчитываются под текущее разрешение кадра;
+- режимы тестирования: вебкамера, видео, фото;
+- крутилка дисторсии (для wide-angle): можно менять силу undistort в рантайме;
+- "квадрат поиска": после потери цели трекер некоторое время ищет её только
+  в области, где она была, и не перескакивает на другой большой контур.
 """
 
 import cv2
 import numpy as np
-import time
 import os
 
 
 class RobustClothingTracker:
     def __init__(self, calibration_file='camera_calib_result.npz'):
-        self.cap = None  # камера инициализируется в run()
+        self.cap = None  # камера инициализируется в run_*()
 
         # Параметры цвета
         self.target_hsv = None
@@ -35,11 +37,15 @@ class RobustClothingTracker:
         # Состояние трекинга
         self.tracking_active = False
         self.lost_frames = 0
-        self.max_lost_frames = 15
+        self.max_lost_frames = 15  # в течение этого времени ищем только в локальном квадрате
 
         # Траектория
         self.trajectory = []
         self.max_trajectory = 30
+
+        # Запоминаем последний bbox цели
+        self.last_bbox = None  # (x, y, w, h)
+        self.search_margin_factor = 1.8  # во сколько раз расширяем bbox для квадрата поиска
 
         # ---- ПАРАМЕТРЫ ДЛЯ РАССТОЯНИЯ ----
         # Фоллбек, если калибровка не загрузится
@@ -56,6 +62,18 @@ class RobustClothingTracker:
         self.cx_orig = None
         self.cy_orig = None
         self.calib_size = None  # (width, height) при калибровке
+        self.dist_coeffs = None  # коэффициенты дисторсии
+
+        # ---- UNDISTORT (крутилка дисторсии) ----
+        self.undistort_enabled = True
+        self.distortion_scale = 1.0   # 0.0 = без коррекции, 1.0 = как в калибровке
+        self.distortion_scale_min = 0.0
+        self.distortion_scale_max = 1.5
+
+        self.undistort_map1 = None
+        self.undistort_map2 = None
+        self.intrinsics_for_frame = None  # матрица камеры для текущего размера + undistort
+        self.last_frame_size = None
 
         self._load_calibration(calibration_file)
 
@@ -63,9 +81,11 @@ class RobustClothingTracker:
         print("РОБАСТНЫЙ ТРЕКЕР ОДЕЖДЫ + КАЛИБРОВАННОЕ РАССТОЯНИЕ")
         print("=" * 50)
         print("Управление:")
-        print("ПРОБЕЛ - захват цвета из центра")
-        print("'+'/'-' - увеличить/уменьшить чувствительность")
-        print("'r' - сброс")
+        print("ПРОБЕЛ    - захват цвета из центра")
+        print("'+'/'-'   - увеличить/уменьшить чувствительность по HSV")
+        print("'[' / ']' - уменьшить/увеличить коррекцию дисторсии")
+        print("'d'       - включить/выключить undistort")
+        print("'r'       - сброс трекера")
         print("'q' или ESC - выход")
         print("=" * 50)
 
@@ -74,17 +94,20 @@ class RobustClothingTracker:
     # ---------------------------------------------------------------------- #
 
     def _load_calibration(self, calibration_file):
-        """Загрузка калибровки камеры (fx, fy, cx, cy, image_size)."""
+        """Загрузка калибровки камеры (fx, fy, cx, cy, dist_coeffs, image_size)."""
         try:
             calib_data = np.load(calibration_file)
             camera_matrix = calib_data['camera_matrix']
-            dist_coeffs = calib_data['dist_coeffs']  # пока не используем
+            dist_coeffs = calib_data['dist_coeffs']
             image_size = calib_data.get('image_size', None)
 
             self.fx_orig = float(camera_matrix[0, 0])
             self.fy_orig = float(camera_matrix[1, 1])
             self.cx_orig = float(camera_matrix[0, 2])
             self.cy_orig = float(camera_matrix[1, 2])
+
+            # dist_coeffs приводим к плоскому float-вектору
+            self.dist_coeffs = np.array(dist_coeffs, dtype=np.float32).ravel()
 
             if image_size is not None:
                 # В npz он лежит как [width, height]
@@ -99,13 +122,15 @@ class RobustClothingTracker:
             print(f"   fx={self.fx_orig:.2f}, fy={self.fy_orig:.2f}, "
                   f"cx={self.cx_orig:.2f}, cy={self.cy_orig:.2f}")
             print(f"   image_size (калибровки): {self.calib_size[0]}x{self.calib_size[1]}")
+            print(f"   dist_coeffs: {self.dist_coeffs}")
 
         except Exception as e:
             self.calibration_loaded = False
+            self.dist_coeffs = None
             print("[КАЛИБРОВКА] Не удалось загрузить:", e)
             print("Работаю с приближённым focal_length =", self.focal_length)
 
-    def _get_effective_intrinsics(self, frame_size):
+    def _build_scaled_camera_matrix(self, frame_size):
         """
         Пересчёт матрицы камеры под текущее разрешение кадра.
         Калибровка делалась, например, при 1920x1080 — это считается масштаб 1.0.
@@ -115,7 +140,6 @@ class RobustClothingTracker:
 
         if self.calibration_loaded and self.calib_size is not None:
             calib_w, calib_h = self.calib_size
-            # масштаб по каждой оси
             scale_x = w_frame / float(calib_w)
             scale_y = h_frame / float(calib_h)
 
@@ -123,13 +147,77 @@ class RobustClothingTracker:
             fy = self.fy_orig * scale_y
             cx = self.cx_orig * scale_x
             cy = self.cy_orig * scale_y
+
+            K_scaled = np.array([[fx, 0, cx],
+                                 [0, fy, cy],
+                                 [0,  0,  1]], dtype=np.float32)
+            return K_scaled
         else:
-            # Фоллбек: примитивная модель камеры
+            # Фоллбек: примитивная матрица камеры
             fx = float(self.focal_length)
             fy = fx
             cx = w_frame / 2.0
             cy = h_frame / 2.0
 
+            K = np.array([[fx, 0, cx],
+                          [0, fy, cy],
+                          [0,  0,  1]], dtype=np.float32)
+            return K
+
+    def _update_undistort_maps(self, frame_size):
+        """
+        Пересчитываем карты undistort при изменении размера кадра или
+        коэффициента дисторсии.
+        """
+        w_frame, h_frame = frame_size
+        K_scaled = self._build_scaled_camera_matrix(frame_size)
+
+        if self.calibration_loaded and self.dist_coeffs is not None:
+            # Масштабируем коэффициенты дисторсии
+            scaled_dist = (self.dist_coeffs * self.distortion_scale).astype(np.float32)
+            scaled_dist = scaled_dist.reshape(-1, 1)
+
+            # Не меняем newCameraMatrix, используем ту же матрицу (без дополнительного кропа)
+            newCameraMatrix = K_scaled.copy()
+
+            self.undistort_map1, self.undistort_map2 = cv2.initUndistortRectifyMap(
+                K_scaled, scaled_dist, None, newCameraMatrix, (w_frame, h_frame), cv2.CV_16SC2
+            )
+
+            self.intrinsics_for_frame = newCameraMatrix
+        else:
+            # Если калибровки нет, undistort не имеет смысла
+            self.undistort_map1 = None
+            self.undistort_map2 = None
+            self.intrinsics_for_frame = K_scaled
+
+        self.last_frame_size = frame_size
+
+    def _ensure_undistort_maps(self, frame_size):
+        """Ленивая пересборка карт undistort при изменении размера или scale."""
+        if self.last_frame_size != frame_size or self.undistort_map1 is None or self.undistort_map2 is None:
+            self._update_undistort_maps(frame_size)
+
+    def _get_effective_intrinsics(self, frame_size):
+        """
+        Возвращает fx, fy, cx, cy для текущего кадра.
+        Если undistort включён, используем матрицу после undistort.
+        Если выключён — просто масштабированную базовую матрицу.
+        """
+        if self.undistort_enabled and self.intrinsics_for_frame is not None:
+            K = self.intrinsics_for_frame
+            fx = float(K[0, 0])
+            fy = float(K[1, 1])
+            cx = float(K[0, 2])
+            cy = float(K[1, 2])
+            return fx, fy, cx, cy
+
+        # Без undistort — просто масштабируем камеру
+        K = self._build_scaled_camera_matrix(frame_size)
+        fx = float(K[0, 0])
+        fy = float(K[1, 1])
+        cx = float(K[0, 2])
+        cy = float(K[1, 2])
         return fx, fy, cx, cy
 
     def calculate_distance_and_angle(self, bbox, frame_size):
@@ -154,7 +242,7 @@ class RobustClothingTracker:
         bbox_center_x = x + w_box / 2.0
         bbox_center_y = y + h_box / 2.0
 
-        # Эффективные параметры камеры для текущего разрешения
+        # Эффективные параметры камеры для текущего кадра
         fx, fy, cx, cy = self._get_effective_intrinsics(frame_size)
 
         # --- 1. Расстояние по ширине торса ---
@@ -186,6 +274,38 @@ class RobustClothingTracker:
             "dist_by_height": dist_by_height_cm / 100.0,
             "bbox_center": (int(bbox_center_x), int(bbox_center_y)),
         }
+
+    # ---------------------------------------------------------------------- #
+    #                   ЛОКАЛЬНЫЙ КВАДРАТ ПОИСКА ПРИ ПОТЕРЕ                  #
+    # ---------------------------------------------------------------------- #
+
+    def _get_search_rect(self, bbox, frame_size):
+        """
+        Строит квадрат поиска вокруг последнего bbox:
+        центр квадрата = центр bbox,
+        сторона = max(w, h) * search_margin_factor.
+        """
+        x, y, w, h = bbox
+        w_frame, h_frame = frame_size
+
+        side = int(max(w, h) * self.search_margin_factor)
+        cx = x + w // 2
+        cy = y + h // 2
+
+        sx = max(0, cx - side // 2)
+        sy = max(0, cy - side // 2)
+        ex = min(w_frame, cx + side // 2)
+        ey = min(h_frame, cy + side // 2)
+
+        return sx, sy, ex - sx, ey - sy  # (x, y, w, h)
+
+    def _contour_center(self, cnt):
+        x, y, w, h = cv2.boundingRect(cnt)
+        return x + w / 2.0, y + h / 2.0
+
+    def _is_point_in_rect(self, px, py, rect):
+        rx, ry, rw, rh = rect
+        return (rx <= px <= rx + rw) and (ry <= py <= ry + rh)
 
     # ---------------------------------------------------------------------- #
     #                        ЦВЕТОВОЙ ТРЕКЕР ОДЕЖДЫ                          #
@@ -234,6 +354,7 @@ class RobustClothingTracker:
 
         self.tracking_active = True
         self.lost_frames = 0
+        self.last_bbox = None  # при новом захвате начинаем с нуля
 
         print(f"Цвет захвачен: HSV{tuple(self.target_hsv)}")
         print(f"Диапазоны: H±{self.h_range}, S±{self.s_range}, V±{self.v_range}")
@@ -290,11 +411,20 @@ class RobustClothingTracker:
         return mask
 
     def process_frame(self, frame):
-        """Обработка одного кадра: трекинг + расчёт расстояния/координат."""
-        display = frame.copy()
+        """Обработка одного кадра: undistort + трекинг + расчёт расстояния/координат."""
+        # Сначала — undistort, если включен
         h, w = frame.shape[:2]
 
-        # Показать ROI для захвата цвета
+        if self.undistort_enabled and self.calibration_loaded and self.dist_coeffs is not None:
+            self._ensure_undistort_maps((w, h))
+            if self.undistort_map1 is not None and self.undistort_map2 is not None:
+                frame = cv2.remap(frame, self.undistort_map1, self.undistort_map2,
+                                  interpolation=cv2.INTER_LINEAR)
+                h, w = frame.shape[:2]
+
+        display = frame.copy()
+
+        # Показать ROI для захвата цвета, если трекинг не активен
         if not self.tracking_active:
             roi_size = min(150, min(h, w) // 3)
             cx, cy = w // 2, h // 2
@@ -327,25 +457,45 @@ class RobustClothingTracker:
         target_found = False
         best_contour = None
 
+        valid_contours = []
         if contours:
-            valid_contours = []
             for cnt in contours:
                 area = cv2.contourArea(cnt)
                 if area > 300:
-                    x, y, w_cnt, h_cnt = cv2.boundingRect(cnt)
-                    aspect_ratio = h_cnt / w_cnt if w_cnt > 0 else 0
+                    x_c, y_c, w_c, h_c = cv2.boundingRect(cnt)
+                    aspect_ratio = h_c / w_c if w_c > 0 else 0
                     if 0.5 < aspect_ratio < 3.0:
                         valid_contours.append((cnt, area))
 
-            if valid_contours:
+        w_frame, h_frame = w, h
+
+        # --- ЛОКАЛЬНЫЙ ПОИСК В КВАДРАТЕ ВОКРУГ last_bbox ---
+        if valid_contours:
+            if self.last_bbox is None or self.lost_frames >= self.max_lost_frames:
+                # Инициализация или давно потеряли — можно брать глобально самый большой
                 valid_contours.sort(key=lambda x: x[1], reverse=True)
                 best_contour = valid_contours[0][0]
                 target_found = True
+            else:
+                # Есть предыдущий bbox и цель недавно потеряна —
+                # ищем только в квадрате вокруг него
+                search_rect = self._get_search_rect(self.last_bbox, (w_frame, h_frame))
+                roi_contours = []
+                for cnt, area in valid_contours:
+                    cx_cnt, cy_cnt = self._contour_center(cnt)
+                    if self._is_point_in_rect(cx_cnt, cy_cnt, search_rect):
+                        roi_contours.append((cnt, area))
+
+                if roi_contours:
+                    roi_contours.sort(key=lambda x: x[1], reverse=True)
+                    best_contour = roi_contours[0][0]
+                    target_found = True
 
         if target_found and best_contour is not None:
             self.lost_frames = 0
 
             x, y, w_box, h_box = cv2.boundingRect(best_contour)
+            self.last_bbox = (x, y, w_box, h_box)
 
             M = cv2.moments(best_contour)
             if M["m00"] > 0:
@@ -360,10 +510,10 @@ class RobustClothingTracker:
             if len(self.trajectory) > self.max_trajectory:
                 self.trajectory.pop(0)
 
-            # --- НОВЫЙ РАСЧЁТ РАССТОЯНИЯ И УГЛА ---
+            # --- РАСЧЁТ РАССТОЯНИЯ И УГЛА ---
             measurements = self.calculate_distance_and_angle(
                 (x, y, w_box, h_box),
-                (w, h)
+                (w_frame, h_frame)
             )
 
             if measurements is not None:
@@ -397,8 +547,8 @@ class RobustClothingTracker:
                          self.trajectory[i], (255, 200, 0), thickness)
 
             # Инфо-бокс
-            info_h = 140
-            info_w = 420
+            info_h = 160
+            info_w = 440
             if h > info_h + 20 and w > info_w + 20:
                 info_bg = np.zeros((info_h, info_w, 3), dtype=np.uint8)
                 info_bg[:] = (40, 40, 40)
@@ -411,6 +561,8 @@ class RobustClothingTracker:
                     f"Angle: {angle_deg:.1f} deg",
                     f"Robot X: {x_robot:.2f} m, Y: {y_robot:.2f} m",
                     f"By W: {dist_by_width:.2f} m, by H: {dist_by_height:.2f} m",
+                    f"Undistort: {'ON' if self.undistort_enabled else 'OFF'}  "
+                    f"scale={self.distortion_scale:.2f}",
                 ]
 
                 for i, text in enumerate(texts):
@@ -424,32 +576,41 @@ class RobustClothingTracker:
             # Потеря цели
             self.lost_frames += 1
 
+            if self.last_bbox is not None:
+                # Рисуем квадрат поиска вокруг последнего места цели
+                search_rect = self._get_search_rect(self.last_bbox, (w_frame, h_frame))
+                sx, sy, sw, sh = search_rect
+                cv2.rectangle(display, (sx, sy), (sx + sw, sy + sh),
+                              (0, 165, 255), 2)
+                cv2.putText(display, f"SEARCHING ({self.lost_frames})",
+                            (sx, max(20, sy - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            (0, 165, 255), 2)
+
             if self.lost_frames < self.max_lost_frames and self.trajectory:
                 last_pos = self.trajectory[-1]
                 cv2.circle(display, last_pos, 15, (0, 165, 255), 2)
-                cv2.putText(display, f"LOST ({self.lost_frames})",
-                            (last_pos[0] - 40, last_pos[1] - 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                            (0, 165, 255), 2)
             else:
                 cv2.putText(display, "TARGET LOST", (w - 180, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             (0, 0, 255), 2)
+                # Если долго потеряны — очищаем траекторию и eventually last_bbox
                 if self.lost_frames > self.max_lost_frames * 2:
                     self.trajectory = []
+                    self.last_bbox = None
 
         # Мини-карта маски
         if mask is not None:
-            mask_small = cv2.resize(mask, (w // 4, h // 4))
+            mask_small = cv2.resize(mask, (w_frame // 4, h_frame // 4))
             mask_colored = cv2.cvtColor(mask_small, cv2.COLOR_GRAY2BGR)
             mask_colored[:, :, 1] = mask_small
-            display[h - h // 4 - 10:h - 10,
-                    w - w // 4 - 10:w - 10] = mask_colored
+            display[h_frame - h_frame // 4 - 10:h_frame - 10,
+                    w_frame - w_frame // 4 - 10:w_frame - 10] = mask_colored
 
         return display, mask
 
     def adjust_sensitivity(self, increase=True):
-        """Регулировка чувствительности."""
+        """Регулировка чувствительности по HSV."""
         factor = 1.2 if increase else 0.8
 
         self.h_range = int(np.clip(self.h_range * factor, 5, 40))
@@ -457,6 +618,23 @@ class RobustClothingTracker:
         self.v_range = int(np.clip(self.v_range * factor, 20, 120))
 
         print(f"Новые диапазоны: H±{self.h_range}, S±{self.s_range}, V±{self.v_range}")
+
+    def adjust_distortion_scale(self, increase=True):
+        """Регулировка силы коррекции дисторсии."""
+        step = 0.1
+        if increase:
+            self.distortion_scale = min(self.distortion_scale_max,
+                                        self.distortion_scale + step)
+        else:
+            self.distortion_scale = max(self.distortion_scale_min,
+                                        self.distortion_scale - step)
+        # Форсируем пересчёт карт при следующем кадре
+        self.undistort_map1 = None
+        self.undistort_map2 = None
+        self.last_frame_size = None
+
+        print(f"Distortion scale: {self.distortion_scale:.2f} "
+              f"({'ON' if self.undistort_enabled else 'OFF'})")
 
     # ---------------------------------------------------------------------- #
     #                            РЕЖИМЫ ЗАПУСКА                              #
@@ -475,11 +653,19 @@ class RobustClothingTracker:
             self.adjust_sensitivity(increase=True)
         elif key == ord('-') or key == ord('_'):
             self.adjust_sensitivity(increase=False)
+        elif key == ord('['):
+            self.adjust_distortion_scale(increase=False)
+        elif key == ord(']'):
+            self.adjust_distortion_scale(increase=True)
+        elif key == ord('d'):
+            self.undistort_enabled = not self.undistort_enabled
+            print("Undistort:", "ON" if self.undistort_enabled else "OFF")
         elif key == ord('r'):
             self.tracking_active = False
             self.target_hsv = None
             self.trajectory = []
             self.lost_frames = 0
+            self.last_bbox = None
             print("Трекер сброшен")
 
     def run_webcam(self, cam_index=0):
