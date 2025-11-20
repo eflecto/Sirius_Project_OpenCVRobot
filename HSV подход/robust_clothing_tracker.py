@@ -55,7 +55,7 @@ class RobustClothingTracker:
         # focal_length — эффективное фокусное расстояние в пикселях.
         # person_width_cm — априорная реальная ширина торса человека.
         self.focal_length = 500
-        self.person_width_cm = 45  # средняя ширина торса
+        self.person_width_cm = 44  # средняя ширина торса
         
         print("="*50)
         print("РОБАСТНЫЙ ТРЕКЕР ОДЕЖДЫ")
@@ -85,7 +85,7 @@ class RobustClothingTracker:
         if roi.size == 0:
             return False
         
-        # Конвертируем в HSV
+        # Конвертируем в HSV 
         # HSV устойчивее к изменению освещения, чем RGB, и удобен для пороговой фильтрации.
         roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         
